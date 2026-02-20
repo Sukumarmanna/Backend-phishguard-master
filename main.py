@@ -3,6 +3,7 @@ import numpy as np
 import re
 import logging
 import os
+import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from urllib.parse import urlparse
@@ -14,7 +15,6 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="PhishGuard AI Backend")
 
-# CORS Settings - Extension connection ke liye must hai
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,54 +23,55 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 1. Model Loading Logic ---
+# --- 1. Model Loading ---
 MODEL_PATH = 'Random_Forest_Model.pkl'
-
 try:
     model = joblib.load(MODEL_PATH)
-    logger.info(f"✅ PhishGuard AI: {MODEL_PATH} Loaded successfully.")
+    # Model ke training features ke naam nikalna (mismatch khatam karne ke liye)
+    if hasattr(model, 'feature_names_in_'):
+        feature_cols = model.feature_names_in_
+    else:
+        feature_cols = [f"f{i}" for i in range(30)]
+    logger.info(f"✅ PhishGuard AI: Model Loaded with {len(feature_cols)} features.")
 except Exception as e:
     logger.error(f"❌ Failed to load model: {e}")
     model = None
 
-# --- 2. Whitelist & Trusted Domains ---
-# YouTube aur social media ko yahan add kiya hai taaki False Positives na aayein
 TRUSTED_DOMAINS = [
     "google.com", "youtube.com", "github.com", "microsoft.com", 
     "amazon.in", "linkedin.com", "apple.com", "instagram.com", 
-    "facebook.com", "twitter.com", "netflix.com"
+    "facebook.com", "twitter.com", "netflix.com", "gmail.com"
 ]
 
-# --- 3. UCI-Based Feature Extraction ---
-def extract_features(url: str):
-    """
-    Note: UCI Dataset 30 features use karta hai. 
-    Ye simplified function model shape (30,) ko match karne ke liye padding karta hai.
-    """
+# Suspicious Patterns (AI se pehle manual check)
+SUSPICIOUS_TLDS = [".pro", ".top", ".xyz", ".club", ".pw", ".link", ".monster"]
+SUSPICIOUS_KEYWORDS = ["auth", "login", "verify", "secure", "update", "banking", "log.php", "signin"]
+
+# --- 2. Feature Extraction with DataFrame ---
+def extract_features_df(url: str):
     parsed_url = urlparse(url)
     hostname = parsed_url.hostname or ""
     
-    # Basic Feature Engineering (Replicating UCI logic)
+    # Basic Feature Extraction logic
     features = [
-        1 if len(url) < 54 else (0 if len(url) <= 75 else -1),  # URL Length
-        1 if "@" not in url else -1,                          # Having @ symbol
-        1 if url.find("//", 7) == -1 else -1,                 # Double slash redirect
-        1 if "-" not in hostname else -1,                     # Prefix-Suffix in domain
-        1 if hostname.count('.') <= 2 else (0 if hostname.count('.') == 3 else -1), # Dots in domain
-        1 if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", hostname) else -1, # IP Address check
-        1 if "https" in url[:5] else -1,                      # HTTPS check
-        1 if len(parsed_url.path.split('/')) < 5 else -1,     # URL Depth
-        -1 if "https" in hostname else 1,                     # HTTPS in domain part
-        1 if "login" not in url.lower() else -1               # Login/Sign-in keywords
+        1 if len(url) < 54 else (0 if len(url) <= 75 else -1),
+        1 if "@" not in url else -1,
+        1 if url.find("//", 7) == -1 else -1,
+        1 if "-" not in hostname else -1,
+        1 if hostname.count('.') <= 2 else (0 if hostname.count('.') == 3 else -1),
+        1 if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", hostname) else -1,
+        1 if "https" in url[:5] else -1,
+        1 if len(parsed_url.path.split('/')) < 5 else -1,
+        -1 if "https" in hostname else 1,
+        1 if not any(kw in url.lower() for kw in ["login", "verify", "auth"]) else -1
     ]
     
-    # Model 30 features expect karta hai
-    # Baki 20 features ko dummy values se fill karte hain
-    expected_features = 30 
-    if len(features) < expected_features:
-        features += [1] * (expected_features - len(features))
-        
-    return np.array(features).reshape(1, -1)
+    # Dummy padding to match 30 features
+    features += [0] * (30 - len(features))
+    
+    # Warning fix: DataFrame mein convert karein taaki feature names mil jayein
+    df = pd.DataFrame([features], columns=feature_cols)
+    return df
 
 class URLInput(BaseModel):
     url: str
@@ -78,48 +79,53 @@ class URLInput(BaseModel):
 @app.post("/predict")
 async def predict(data: URLInput):
     if not model:
-        raise HTTPException(status_code=500, detail="ML Model not found on server.")
+        raise HTTPException(status_code=500, detail="ML Model not found.")
 
     url = data.url.lower().strip()
     if not url.startswith(('http://', 'https://')):
         url = 'https://' + url
 
-    hostname = urlparse(url).hostname or ""
+    parsed = urlparse(url)
+    hostname = parsed.hostname or ""
+    path = parsed.path
 
-    # Step 1: Whitelist Check (YouTube Fix)
+    # Step 1: Whitelist Check
     if any(domain == hostname or hostname.endswith('.' + domain) for domain in TRUSTED_DOMAINS):
-        logger.info(f"🟢 Whitelist Hit: {hostname}")
         return {"prediction": "safe", "is_phishing": False, "confidence": 1.0}
 
-    # Step 2: ML Prediction
-    try:
-        features = extract_features(url)
-        prediction = model.predict(features)[0]
-        
-        # Random Forest confidence score
-        if hasattr(model, "predict_proba"):
-            probabilities = model.predict_proba(features)[0]
-            # UCI labels usually are -1 (phishing) and 1 (legitimate)
-            # Probability index depends on how model was trained
-            phishing_chance = float(probabilities[0]) if prediction == -1 else (1 - float(probabilities[1]))
-        else:
-            phishing_chance = 1.0 if prediction == -1 else 0.0
+    # Step 2: Strict Heuristic Overwrite (Manual Check)
+    # Agar TLD khatarnak hai ya path mein 'log.php' jaisa kuch hai
+    if any(hostname.endswith(tld) for tld in SUSPICIOUS_TLDS) or \
+       any(kw in path for kw in ["log.php", "login.php", "auth"]):
+        logger.info(f"🚩 Manual Flag: Suspicious pattern in {url}")
+        return {"prediction": "phishing", "is_phishing": True, "confidence": 0.99}
 
-        # Thresholding
-        is_phishing = True if prediction == -1 else False
+    # Step 3: ML Prediction
+    try:
+        features_df = extract_features_df(url)
         
+        # Probabilities nikalna
+        if hasattr(model, "predict_proba"):
+            probs = model.predict_proba(features_df)[0]
+            # UCI dataset mein -1 phishing hota hai aur 1 legitimate
+            # Probs check: Agar phishing chance 0.4 se upar hai toh risk hai
+            phishing_score = float(probs[0]) 
+            is_phishing = True if phishing_score > 0.45 else False # Threshold lowered for safety
+        else:
+            prediction = model.predict(features_df)[0]
+            is_phishing = True if prediction == -1 else False
+            phishing_score = 1.0 if is_phishing else 0.0
+
         return {
             "prediction": "phishing" if is_phishing else "safe",
             "is_phishing": bool(is_phishing),
-            "confidence": round(phishing_chance, 2)
+            "confidence": round(phishing_score, 2)
         }
     except Exception as e:
-        logger.error(f"❌ Prediction Error: {e}")
-        return {"prediction": "error", "is_phishing": False, "detail": "Analysis failed"}
+        logger.error(f"❌ Error: {e}")
+        return {"prediction": "error", "is_phishing": False}
 
-# --- 4. Render Dynamic Port Handling ---
 if __name__ == "__main__":
     import uvicorn
-    # Render $PORT environment variable use karta hai
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT", 10000))
     uvicorn.run(app, host="0.0.0.0", port=port)
