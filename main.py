@@ -2,20 +2,18 @@ import joblib
 import numpy as np
 import re
 import os
-import logging
 import pandas as pd
+import logging
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from urllib.parse import urlparse
 from fastapi.middleware.cors import CORSMiddleware
 
-# Logging Setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="PhishGuard AI Backend")
+app = FastAPI()
 
-# CORS Middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,82 +21,77 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 1. Model Loading Logic ---
-# Model ka naam wahi rakhein jo aapki repository mein hai
-MODEL_FILE = 'Random_Forest_Model.pkl' 
-
-if os.path.exists(MODEL_FILE):
-    try:
-        # Model ko load karna
-        model = joblib.load(MODEL_FILE)
-        
-        # Feature names mismatch fix (Warning hatane ke liye)
-        if hasattr(model, 'feature_names_in_'):
-            feature_cols = model.feature_names_in_
-        else:
-            feature_cols = [f"f{i}" for i in range(30)] # UCI default 30 features
-            
-        logger.info(f"✅ Model '{MODEL_FILE}' loaded successfully.")
-    except Exception as e:
-        logger.error(f"❌ Error loading model file: {e}")
-        model = None
-else:
-    logger.error(f"❌ Critical Error: Model file '{MODEL_FILE}' not found!")
+# --- 1. CSV Data Loading (Robust Fix) ---
+try:
+    # safe_url.csv load karte waqt sabhi values ko string force karein
+    safe_df = pd.read_csv('safe_url.csv', dtype=str) 
+    
+    # Column 0 se URLs nikalna aur null/empty values hatana
+    safe_list = safe_df.iloc[:, 0].dropna().astype(str).str.lower().str.strip().tolist()
+    
+    SAFE_URLS_SET = set(safe_list)
+    logger.info(f"✅ Loaded {len(SAFE_URLS_SET)} safe URLs from CSV.")
+except Exception as e:
+    logger.error(f"❌ CSV Load Error: {e}")
+    SAFE_URLS_SET = set()
+# --- 2. Model Loading ---
+MODEL_FILE = 'Random_Forest_Model.pkl'
+try:
+    model = joblib.load(MODEL_FILE)
+    feature_cols = model.feature_names_in_ if hasattr(model, 'feature_names_in_') else [f"f{i}" for i in range(30)]
+    logger.info("✅ ML Model Loaded.")
+except Exception as e:
+    logger.error(f"❌ Model Load Error: {e}")
     model = None
 
-# --- 2. Feature Extraction ---
-def extract_features(url: str):
-    parsed_url = urlparse(url)
-    hostname = parsed_url.hostname or ""
-    
-    # UCI 30 features logic (Sample mapping)
-    # Aapka model exactly 30 features expect karta hai
-    features = [0] * 30 
-    features[0] = 1 if len(url) < 54 else -1
-    features[1] = 1 if "@" not in url else -1
-    features[6] = 1 if "https" in url[:5] else -1
-    features[9] = 1 if not any(kw in url.lower() for kw in ["login", "auth", "verify"]) else -1
-    
-    # DataFrame banana taaki model ko 'feature names' mil sakein
-    return pd.DataFrame([features], columns=feature_cols)
+# --- 3. Feature Extraction ---
+def extract_features(url):
+    # UCI 30 features logic
+    f = [1] * 30 # Default 1 (Safe)
+    hostname = urlparse(url).hostname or ""
+    f[0] = 1 if len(url) < 54 else (-1 if len(url) > 75 else 0)
+    f[6] = 1 if url.startswith('https') else -1
+    return pd.DataFrame([f], columns=feature_cols)
 
 class URLInput(BaseModel):
     url: str
 
 @app.post("/predict")
 async def predict(data: URLInput):
-    if model is None:
-        raise HTTPException(status_code=500, detail="Model file missing on server.")
-
-    url = data.url.strip()
+    url = data.url.lower().strip()
     
-    # Manual Heuristics (Security Researcher logic)
-    # Naye phishing domains ke liye manual block
-    if any(url.endswith(tld) for tld in [".pro", ".top", ".xyz"]) or "log.php" in url:
+    # STEP 1: Direct CSV Lookup (First Priority)
+    # Agar URL aapki safe_url.csv mein hai, toh ML ki zaroorat hi nahi
+    if url in SAFE_URLS_SET or any(domain in url for domain in ["google.com", "youtube.com"]):
+        logger.info(f"🟢 Safe CSV Match: {url}")
+        return {"prediction": "safe", "is_phishing": False, "confidence": 1.0}
+
+    # STEP 2: Manual Pattern Check (Security Researcher Logic)
+    if ".pro" in url or "log.php" in url:
         return {"prediction": "phishing", "is_phishing": True, "confidence": 0.99}
 
+    # STEP 3: ML Model Prediction
+    if not model:
+        return {"prediction": "safe", "is_phishing": False}
+
     try:
-        # Feature extract karke prediction karna
         features_df = extract_features(url)
-        
         if hasattr(model, "predict_proba"):
             probs = model.predict_proba(features_df)[0]
-            # UCI dataset labels: index 0 typically means Phishing (-1)
-            phishing_prob = float(probs[0])
-            is_phish = phishing_prob > 0.48 # Strict threshold for safety
+            phishing_score = float(probs[0])
+            # Threshold balance: Agar 70% shak hai tabhi Danger
+            is_phish = phishing_score > 0.70 
         else:
-            prediction = model.predict(features_df)[0]
-            is_phish = True if prediction == -1 else False
-            phishing_prob = 1.0 if is_phish else 0.0
+            is_phish = model.predict(features_df)[0] == -1
+            phishing_score = 1.0 if is_phish else 0.0
 
         return {
             "prediction": "phishing" if is_phish else "safe",
             "is_phishing": bool(is_phish),
-            "confidence": round(phishing_prob, 2)
+            "confidence": round(phishing_score, 2)
         }
     except Exception as e:
-        logger.error(f"❌ Prediction Error: {e}")
-        return {"prediction": "error", "detail": str(e)}
+        return {"prediction": "safe", "is_phishing": False}
 
 if __name__ == "__main__":
     import uvicorn
